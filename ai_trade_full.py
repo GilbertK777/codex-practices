@@ -180,6 +180,10 @@ class ExchangeClient(abc.ABC):
     def fetch_funding_rate(self, symbol: str) -> float:
         ...
 
+    @abc.abstractmethod
+    def cancel_all_orders(self, symbol: str):
+        ...
+
 # ──────────────────────── 3-1) Binance Futures 구현 ────────────────────────
 class BinanceFutures(ExchangeClient):
     """Binance USD-M 선물 거래소 구현 클래스"""
@@ -253,6 +257,17 @@ class BinanceFutures(ExchangeClient):
             logging.error(f"Binance 펀딩률 조회 실패: {e}")
             return 0.0
 
+    def cancel_all_orders(self, symbol: str):
+        """지정된 심볼의 모든 대기 주문 취소"""
+        try:
+            self.client.cancel_all_orders(symbol)
+            logging.info(f"[Binance] {symbol}의 모든 대기 주문 취소 완료")
+        except Exception as e:
+            logging.error(f"[Binance] 주문 취소 실패: {e}")
+            # 주문 취소 실패는 치명적일 수 있으므로 예외를 다시 발생시킬 수 있음
+            # 여기서는 로깅만 하고 계속 진행
+            pass
+
 # ───────────────────────── 3-2) Bybit Futures 구현 ─────────────────────────
 class BybitFutures(ExchangeClient):
     """Bybit USDT-M 선물 거래소 구현 클래스"""
@@ -320,8 +335,8 @@ class BybitFutures(ExchangeClient):
         params = {
             "stopPrice": stop_price,
             "reduceOnly": True,
-            "triggerDirection": trigger_dir
-            # Bybit의 경우 closeOnTrigger 옵션 대신 reduceOnly로 포지션 청산 처리
+            "triggerDirection": trigger_dir,
+            "closeOnTrigger": True  # Bybit: 트리거 시 포지션 전체 종료
         }
         return self.client.create_order(symbol=symbol, type=order_type,
                                         side=side_upper, amount=qty, params=params)
@@ -337,6 +352,15 @@ class BybitFutures(ExchangeClient):
         except Exception as e:
             logging.error(f"Bybit 펀딩률 조회 실패: {e}")
             return 0.0
+
+    def cancel_all_orders(self, symbol: str):
+        """지정된 심볼의 모든 대기 주문 취소"""
+        try:
+            self.client.cancel_all_orders(symbol)
+            logging.info(f"[Bybit] {symbol}의 모든 대기 주문 취소 완료")
+        except Exception as e:
+            logging.error(f"[Bybit] 주문 취소 실패: {e}")
+            pass
 
 # ───────────────────────── 4) 데이터 레이어 ──────────────────────────
 class IndicatorRepository:
@@ -535,7 +559,7 @@ class OrderService:
     def _pnl(self, exit_px: float) -> float:
         """
         현재 포지션을 exit_px 가격에 청산했을 때의 손익(PnL)을 계산.
-        계산식: (진입 대비 가격차 * 수량 * 레버리지) – (왕복 수수료) – (펀딩비)
+        계산식: (진입 대비 가격차 * 수량) – (왕복 수수료) – (펀딩비)
         """
         if not self.pos:
             return 0.0
@@ -544,12 +568,13 @@ class OrderService:
         side  = self.pos["side"]
         # Long: (종료가 - 진입가), Short: (진입가 - 종료가)
         delta = (exit_px - entry) if side == "long" else (entry - exit_px)
-        # 추정 수수료: 포지션 명목 가치 * 0.06% * 2 (진입+청산) 
+        # 추정 수수료: 포지션 명목 가치 * 0.06% * 2 (진입+청산)
         fee = abs(exit_px * qty) * 0.0006
         # 펀딩비 (8시간 간격) – 단순 현재 펀딩률로 8시간치 예측
         frate = self.ex.fetch_funding_rate(CFG.SYMBOL)
         funding = abs(entry * qty) * frate
-        return delta * qty * CFG.LEVERAGE - fee - funding
+        # PnL = (가격 변화 * 수량) - 수수료 - 펀딩비. 레버리지는 PnL 자체에 곱해지지 않음.
+        return delta * qty - fee - funding
     
     # ---------- 진입 후 TP/SL 예약주문 부착 ----------
     def _attach_tp_sl(self, side: str, entry_px: float, qty: float):
@@ -618,6 +643,62 @@ class OrderService:
             tg(f"🚀 {'[PAPER]' if self.paper else '[LIVE]'} {side.upper()} 진입 @ {entry_px:.2f}")
             # 진입 후 바로 TP/SL 예약 주문 설정
             self._attach_tp_sl(side, entry_px, qty)
+
+    # ---------- 포지션 강제 종료 (전략/수동) ----------
+    def close_position(self, px: float, reason: str = "STRATEGY"):
+        """
+        현재 포지션을 시장가로 즉시 종료.
+        - Live 모드: 기존 TP/SL 주문 취소 -> 시장가 청산 주문.
+        - Paper 모드: 가상으로 청산 처리 및 PnL 계산.
+        """
+        with self.lock:
+            if not self.pos:
+                return
+
+            side = self.pos["side"]
+            qty = self.pos["qty"]
+            exit_px = px
+            exit_side = "sell" if side == "long" else "buy"
+
+            if not self.paper:
+                try:
+                    # 1) Live 모드: 기존 TP/SL 주문 모두 취소
+                    self.ex.cancel_all_orders(CFG.SYMBOL)
+                    # 2) 시장가로 포지션 종료 주문
+                    order = self.ex.create_market_order(CFG.SYMBOL, exit_side, qty)
+                    exit_px = float(order.get("price", order.get("avgPrice", px)))
+                except Exception as e:
+                    logging.error(f"강제청산 주문 실패: {e}")
+                    tg(f"⚠️ {side.upper()} 강제청산 실패: {e}")
+                    return  # 청산 실패 시 포지션 유지
+            else:
+                # Paper 모드: 슬리피지 적용
+                exit_px = px * (1 - CFG.SLIP_PCT) if side == "long" else px * (1 + CFG.SLIP_PCT)
+
+            # --- 공통 청산 후 처리 ---
+            pnl = self._pnl(exit_px)
+            if self.paper:
+                self.balance += pnl
+
+            self.trades.append({
+                "time": datetime.utcnow(),
+                "side": f"CLOSE_{side.upper()}",
+                "price": exit_px,
+                "bal": self.balance,
+                "pnl": pnl,
+                "reason": reason
+            })
+            tg(f"✅ {'[PAPER]' if self.paper else '[LIVE]'} {side.upper()} 청산({reason}) @ {exit_px:.2f}, PnL={pnl:.2f}")
+
+            if pnl < 0:
+                self.loss_cnt += 1
+                if self.loss_cnt >= CFG.MAX_LOSS:
+                    self.pause_until = datetime.utcnow() + timedelta(hours=CFG.PAUSE_HR)
+                    tg(f"⛔ 연속 손실 {self.loss_cnt}회 발생 – {CFG.PAUSE_HR}시간 휴식 모드")
+            else:
+                self.loss_cnt = 0
+
+            self.pos = None  # 포지션 리셋
     
     # ---------- 포지션 종료 체크 (paper 모드 전용) ----------
     def poll_position_closed(self, px_now: float):
@@ -626,40 +707,19 @@ class OrderService:
         도달 시 포지션을 청산하고 PnL 계산하여 가상 잔고 업데이트.
         (live 모드: TP/SL는 거래소가 자동 처리하므로 봇에서는 확인하지 않음)
         """
-        if not self.pos:
+        if not self.pos or not self.paper:
             return
-        if not self.paper:
-            # 실거래 모드: 거래소가 이미 TP/SL로 포지션 정리함. (여기서는 처리 없음)
-            return
-        entry = self.pos["entry"]; qty = self.pos["qty"]; side = self.pos["side"]
+
+        entry = self.pos["entry"]; side = self.pos["side"]
         # 롱 포지션의 TP/SL 조건
         hit_tp = (px_now >= entry * (1 + CFG.TP_PCT)) if side == "long" else (px_now <= entry * (1 - CFG.TP_PCT))
         hit_sl = (px_now <= entry * (1 - CFG.SL_PCT)) if side == "long" else (px_now >= entry * (1 + CFG.SL_PCT))
-        if not (hit_tp or hit_sl):
-            return  # 아직 청산가격 도달 안함
         
-        # 포지션 청산 처리
-        pnl = self._pnl(px_now)  # 손익 계산
-        self.balance += pnl      # 가상 잔고 갱신
-        # 거래 내역 저장 (청산)
-        self.trades.append({
-            "time": datetime.utcnow(),
-            "side": f"CLOSE_{side.upper()}",
-            "price": px_now,
-            "bal": self.balance,
-            "pnl": pnl
-        })
-        tg(f"✅ [PAPER] {side.upper()} 청산 @ {px_now:.2f}  PnL={pnl:.2f}")
-        # 연속 손실 체크
-        if pnl < 0:
-            self.loss_cnt += 1
-            if self.loss_cnt >= CFG.MAX_LOSS:
-                self.pause_until = datetime.utcnow() + timedelta(hours=CFG.PAUSE_HR)
-                tg(f"⛔ 연속 손실 {self.loss_cnt}회 발생 – {CFG.PAUSE_HR}시간 휴식 모드")
-        else:
-            self.loss_cnt = 0
-        self.pos = None  # 포지션 없음 상태로 리셋
-    
+        if hit_tp:
+            self.close_position(px_now, reason="TP")
+        elif hit_sl:
+            self.close_position(px_now, reason="SL")
+
     # ---------- 트레이딩 일시정지 여부 확인 ----------
     def is_paused(self) -> bool:
         """
@@ -738,10 +798,19 @@ class TradingBot:
                         qty = min(qty, CFG.MAX_QTY)
                         self.order.open_position(last["close"], qty, "short")
                 else:
-                    # --- 포지션 보유 중이면 청산 조건 확인 (paper 모드) ---
-                    # Live 모드에서는 거래소의 주문으로 청산되므로 따로 처리하지 않음
-                    self.order.poll_position_closed(last["close"])
-                
+                    # --- 포지션 보유 중: 청산 조건 확인 ---
+                    pos_side = self.order.pos["side"]
+                    should_exit = (pos_side == "long" and last["exit_l"]) or \
+                                  (pos_side == "short" and last["exit_s"])
+
+                    if should_exit:
+                        # 1) 전략에 따른 청산 신호 발생
+                        self.order.close_position(last["close"], reason="STRATEGY")
+                    else:
+                        # 2) Paper 모드에서 TP/SL 도달 여부 확인
+                        # (Live 모드에서는 서버에서 처리되므로 이 로직은 무시됨)
+                        self.order.poll_position_closed(last["close"])
+
                 time.sleep(CFG.SLEEP_SEC)
             except Exception as e:
                 logging.error(f"메인 루프 오류: {e}")
